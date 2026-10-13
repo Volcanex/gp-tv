@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+"""
+ds3-pair: pair a PlayStation 3 DualShock (Sixaxis) with this Pi over bluetooth.
+
+Run it as root with the pad connected by USB. It does three things:
+
+  1. sixpair   Writes this adapter's MAC into the pad, so the pad knows which
+               host to call when you press the PS button. A DS3 has no pairing
+               UI: this write IS the pairing.
+
+  2. sdp forge A DS3 does not answer SDP browses on an incoming connection, so
+               bluetoothd has no HID service record for it and refuses the HID
+               session with:
+                   hidp_add_connection() Could not parse HID SDP record:
+                   No such file or directory (2)
+               That ENOENT is semantic, not a missing file: extract_hid_record()
+               could not find attribute 0x0206 (HIDDescriptorList). So we read
+               the pad's real HID report descriptor over USB, hand-build the
+               SDP record bluetoothd would otherwise have had to ask for, and
+               drop it into its cache in the format bluetoothd itself writes.
+
+  3. trust     Write the device info file so the pad is known, trusted and
+               carries the HID service UUID.
+
+Also needs, already in place on this box, /etc/bluetooth/input.conf:
+    ClassicBondedOnly=false   a DS3 never bonds, so unbonded HID must be allowed
+    UserspaceHID=true
+
+Undo:
+    systemctl stop bluetooth
+    rm -rf /var/lib/bluetooth/<adapter>/<pad> /var/lib/bluetooth/<adapter>/cache/<pad>
+    systemctl start bluetooth
+"""
+
+import array
+import fcntl
+import time
+import os
+import re
+import subprocess
+import sys
+
+VID, PID = 0x054C, 0x0268
+BUS_USB = 0x03
+DESC_SAVE = "/var/lib/gabepi/ds3-report-descriptor.bin"
+RECORD_HANDLE = 0x00010000
+
+
+def die(msg):
+    print("ds3-pair: %s" % msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def say(msg):
+    print("  %s" % msg, flush=True)
+
+
+# --------------------------------------------------------------------------
+# SDP data element encoding. First byte is (type << 3) | size_index.
+# Verified against the records bluetoothd itself wrote into this adapter's
+# cache for other devices.
+# --------------------------------------------------------------------------
+
+def u8(v):
+    return bytes([0x08, v & 0xFF])
+
+
+def u16(v):
+    return bytes([0x09]) + v.to_bytes(2, "big")
+
+
+def u32(v):
+    return bytes([0x0A]) + v.to_bytes(4, "big")
+
+
+def uuid16(v):
+    return bytes([0x19]) + v.to_bytes(2, "big")
+
+
+def boolean(v):
+    return bytes([0x28, 1 if v else 0])
+
+
+def text(val):
+    b = val.encode() if isinstance(val, str) else bytes(val)
+    if len(b) < 0x100:
+        return bytes([0x25, len(b)]) + b
+    return bytes([0x26]) + len(b).to_bytes(2, "big") + b
+
+
+def seq(*parts):
+    b = b"".join(parts)
+    if len(b) < 0x100:
+        return bytes([0x35, len(b)]) + b
+    return bytes([0x36]) + len(b).to_bytes(2, "big") + b
+
+
+def attr(aid, value):
+    return u16(aid) + value
+
+
+def build_hid_record(descriptor, name="PLAYSTATION(R)3 Controller"):
+    """The DS3's HID service record, attributes in ascending id order."""
+    L2CAP, HIDP, HID_SVC = 0x0100, 0x0011, 0x1124
+    PSM_CTRL, PSM_INTR = 0x0011, 0x0013
+
+    return seq(
+        attr(0x0000, u32(RECORD_HANDLE)),                       # record handle
+        attr(0x0001, seq(uuid16(HID_SVC))),                     # service class
+        attr(0x0004, seq(seq(uuid16(L2CAP), u16(PSM_CTRL)),     # protocols
+                         seq(uuid16(HIDP)))),
+        attr(0x0005, seq(uuid16(0x1002))),                      # browse group
+        attr(0x0006, seq(u16(0x656E), u16(0x006A), u16(0x0100))),  # lang base
+        attr(0x0009, seq(seq(uuid16(HID_SVC), u16(0x0100)))),   # profile desc
+        attr(0x000D, seq(seq(seq(uuid16(L2CAP), u16(PSM_INTR)), # additional
+                             seq(uuid16(HIDP))))),
+        attr(0x0100, text(name)),                               # service name
+        attr(0x0101, text(name)),                               # description
+        attr(0x0102, text("Sony Computer Entertainment")),      # provider
+        attr(0x0200, u16(0x0100)),                              # release number
+        attr(0x0201, u16(0x0111)),                              # parser version
+        attr(0x0202, u8(0x08)),                                 # device subclass
+        attr(0x0203, u8(0x21)),                                 # country code
+        attr(0x0204, boolean(True)),                            # virtual cable
+        attr(0x0205, boolean(True)),                            # reconnect init
+        attr(0x0206, seq(seq(u8(0x22), text(descriptor)))),     # THE descriptor
+        attr(0x0207, seq(seq(u16(0x0409), u16(0x0100)))),       # langid base
+        attr(0x0209, boolean(True)),                            # battery power
+        attr(0x020A, boolean(True)),                            # remote wake
+        attr(0x020B, u16(0x0100)),                              # profile version
+        attr(0x020C, u16(0x0C80)),                              # supervision t/o
+        attr(0x020D, boolean(False)),                           # normally conn.
+        attr(0x020E, boolean(False)),                           # boot device
+    )
+
+
+# --------------------------------------------------------------------------
+# hidraw feature reports: the sixpair handshake
+# --------------------------------------------------------------------------
+
+def _ioc(direction, typ, nr, size):
+    return (direction << 30) | (size << 16) | (typ << 8) | nr
+
+
+def HIDIOCSFEATURE(n):
+    return _ioc(3, ord("H"), 0x06, n)
+
+
+def HIDIOCGFEATURE(n):
+    return _ioc(3, ord("H"), 0x07, n)
+
+
+def pad_address(fd):
+    """Feature report 0xf2 carries the pad's own BD address at offset 4."""
+    buf = array.array("B", [0xF2] + [0] * 16)
+    fcntl.ioctl(fd, HIDIOCGFEATURE(len(buf)), buf, True)
+    return ":".join("%02X" % b for b in buf[4:10])
+
+
+def get_central(fd):
+    """Feature report 0xf5 carries the stored host address at offset 2."""
+    buf = array.array("B", [0xF5] + [0] * 7)
+    fcntl.ioctl(fd, HIDIOCGFEATURE(len(buf)), buf, True)
+    return ":".join("%02X" % b for b in buf[2:8])
+
+
+def set_central(fd, mac_bytes):
+    """0xf5, then 0x01, then the six MAC bytes. No pad byte between them."""
+    buf = array.array("B", [0xF5, 0x01] + list(mac_bytes))
+    fcntl.ioctl(fd, HIDIOCSFEATURE(len(buf)), buf, True)
+
+
+# --------------------------------------------------------------------------
+
+def find_pad():
+    root = "/sys/class/hidraw"
+    if not os.path.isdir(root):
+        return None, None
+    for node in sorted(os.listdir(root)):
+        dev = os.path.join(root, node, "device")
+        try:
+            with open(os.path.join(dev, "uevent")) as fh:
+                uevent = fh.read()
+        except OSError:
+            continue
+        m = re.search(r"HID_ID=([0-9A-Fa-f]+):([0-9A-Fa-f]+):([0-9A-Fa-f]+)", uevent)
+        if not m:
+            continue
+        bus, vid, pid = (int(g, 16) for g in m.groups())
+        if (vid, pid) == (VID, PID) and bus == BUS_USB:
+            return node, dev
+    return None, None
+
+
+def adapter_address():
+    for path in ("/sys/class/bluetooth/hci0/address",):
+        try:
+            with open(path) as fh:
+                return fh.read().strip().upper()
+        except OSError:
+            pass
+    out = subprocess.run(["bluetoothctl", "show"], capture_output=True, text=True).stdout
+    m = re.search(r"Controller ([0-9A-F:]{17})", out, re.I)
+    if m:
+        return m.group(1).upper()
+    entries = [d for d in os.listdir("/var/lib/bluetooth") if re.fullmatch(r"([0-9A-F]{2}:){5}[0-9A-F]{2}", d)]
+    if len(entries) == 1:
+        return entries[0]
+    die("could not determine the adapter address")
+
+
+def read_or_none(path):
+    try:
+        with open(path) as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def write_private(path, content):
+    with open(path, "w") as fh:
+        fh.write(content)
+    os.chmod(path, 0o600)
+
+
+def main():
+    if os.geteuid() != 0:
+        die("must run as root")
+
+    # udev fires on the hidraw ADD, but hid-sony re-probes a DualShock and the
+    # node can vanish and come back underneath us. Wait it out rather than
+    # giving up on the first look.
+    node = dev = None
+    for attempt in range(30):
+        node, dev = find_pad()
+        if node:
+            break
+        time.sleep(0.5)
+    if not node:
+        die("no DualShock 3 found on USB. Plug the pad in with its cable and rerun.")
+    say("pad found on /dev/%s" % node)
+
+    with open(os.path.join(dev, "report_descriptor"), "rb") as fh:
+        descriptor = fh.read()
+    if not descriptor:
+        die("the pad reported an empty HID descriptor")
+    say("HID report descriptor: %d bytes" % len(descriptor))
+
+    os.makedirs(os.path.dirname(DESC_SAVE), exist_ok=True)
+    with open(DESC_SAVE, "wb") as fh:
+        fh.write(descriptor)
+
+    adapter = adapter_address()
+    mac_bytes = [int(x, 16) for x in adapter.split(":")]
+    say("adapter: %s" % adapter)
+
+    central_changed = False
+    fd = os.open("/dev/%s" % node, os.O_RDWR)
+    try:
+        pad = pad_address(fd)
+        say("pad address: %s" % pad)
+        before = get_central(fd)
+        if before == adapter:
+            say("pad already points at this adapter")
+        else:
+            central_changed = True
+            set_central(fd, mac_bytes)
+            after = get_central(fd)
+            if after != adapter:
+                die("sixpair write failed: pad now points at %s, wanted %s" % (after, adapter))
+            say("sixpair: %s -> %s" % (before, adapter))
+    finally:
+        os.close(fd)
+
+    record = build_hid_record(descriptor)
+    say("SDP record: %d bytes" % len(record))
+
+    dev_dir = "/var/lib/bluetooth/%s/%s" % (adapter, pad)
+    cache_dir = "/var/lib/bluetooth/%s/cache" % adapter
+    cache_file = "%s/%s" % (cache_dir, pad)
+
+    info_text = "\n".join([
+        "[General]",
+        "Name=Sony PLAYSTATION(R)3 Controller",
+        "Class=0x002508",
+        "SupportedTechnologies=BR/EDR;",
+        "Trusted=true",
+        "Blocked=false",
+        "Services=00001124-0000-1000-8000-00805f9b34fb;",
+        "WakeAllowed=true",
+        "",
+        "[DeviceID]",
+        "Source=1",
+        "Vendor=%d" % VID,
+        "Product=%d" % PID,
+        "Version=256",
+        "",
+    ])
+
+    cache_text = "\n".join([
+        "[General]",
+        "Name=Sony PLAYSTATION(R)3 Controller",
+        "",
+        "[ServiceRecords]",
+        "0x%08X=%s" % (RECORD_HANDLE, record.hex().upper()),
+        "",
+    ])
+
+    # Restarting bluetoothd drops every active bluetooth connection, so only do
+    # it when something actually changed. This lets the udev rule run us on
+    # every cable plug, including a plug that is only charging the pad.
+    if read_or_none("%s/info" % dev_dir) == info_text and \
+            read_or_none(cache_file) == cache_text and not central_changed:
+        print()
+        print("Already paired and cached, nothing to do.")
+        print("Unplug the cable and press the PS button.")
+        return
+
+    subprocess.run(["systemctl", "stop", "bluetooth"], check=True)
+
+    os.makedirs(dev_dir, exist_ok=True)
+    os.chmod(dev_dir, 0o700)
+    os.makedirs(cache_dir, exist_ok=True)
+    os.chmod(cache_dir, 0o700)
+    write_private("%s/info" % dev_dir, info_text)
+    write_private(cache_file, cache_text)
+
+    subprocess.run(["systemctl", "start", "bluetooth"], check=True)
+
+    say("wrote %s" % cache_file)
+    print()
+    print("Done. Now unplug the cable and press the PS button.")
+    print("Watch it land with:  journalctl -u bluetooth -f")
+
+
+if __name__ == "__main__":
+    main()

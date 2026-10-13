@@ -1,0 +1,16 @@
+# A PlayStation 3 DualShock pairs by having the host MAC written into it over
+# USB, so the cable plug is the pairing gesture. Run ds3-pair on every DS3 that
+# appears on USB: it is idempotent and only restarts bluetoothd when something
+# actually changed, so plugging a pad in purely to charge costs nothing.
+#
+# ATTRS{} walks up to the USB parent, so this matches cable-connected pads only,
+# never a pad that is already connected over bluetooth.
+#
+# The unit name carries %k (the hidraw node) and --collect is set, because a
+# fixed name that has once failed blocks every later run with "Unit
+# ds3-pair.service was already loaded" and the next pad you plug in is silently
+# ignored.
+#
+# Added 2026-09-22. Undo: rm this file, udevadm control --reload.
+ACTION=="add", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="0268", \
+  RUN+="/usr/bin/systemd-run --no-block --collect --unit=ds3-pair-%k /usr/local/sbin/ds3-pair"

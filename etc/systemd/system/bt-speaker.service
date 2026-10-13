@@ -1,0 +1,17 @@
+[Unit]
+Description=Keep the Bluetooth speaker radio up and discoverable
+After=bluetooth.service
+Requires=bluetooth.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/bin/sleep 5
+ExecStart=/usr/sbin/rfkill unblock bluetooth
+ExecStart=/usr/bin/bluetoothctl power on
+ExecStart=/usr/bin/bluetoothctl discoverable on
+ExecStart=/usr/bin/bluetoothctl pairable on
+ExecStart=/usr/bin/bluetoothctl system-alias "Gabe’s Epic Speakers"
+
+[Install]
+WantedBy=multi-user.target

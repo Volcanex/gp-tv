@@ -1,0 +1,27 @@
+# The daily routine the TV home screen shows (bottom right, beside the clock).
+# install.sh copies this to routine.txt once and never overwrites it after, so
+# edit routine.txt on the Pi. It is read fresh every minute, so the TV follows
+# without a restart.
+#
+# One block per line:  START  END  NAME  [ / note ]      (24h times, END may be 24:00)
+# [weekday] lines apply Monday to Friday, [weekend] lines Saturday and Sunday.
+# Between two blocks the screen shows the next one coming up.
+
+[weekday]
+08:00 09:00 Morning / breakfast
+09:00 12:30 Work
+12:30 13:30 Lunch
+13:30 17:30 Work
+18:00 19:00 Dinner
+19:00 23:00 Free time
+23:00 24:00 Wind down
+00:00 08:00 Sleep
+
+[weekend]
+09:00 10:00 Morning / breakfast
+10:00 13:00 Out
+13:00 14:00 Lunch
+14:00 18:00 Free time
+18:00 19:00 Dinner
+19:00 24:00 Evening
+00:00 09:00 Sleep

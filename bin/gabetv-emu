@@ -1,0 +1,13 @@
+#!/bin/bash
+# gabetv-emu: launch retroarch on the TV. All stage handling (airplay, game
+# mode, realtime priority, restore on exit) lives in gabetv-run.
+#
+# Quit from the pad: the PS button.
+#
+# Settings that must stick live in /etc/gabetv/retroarch-override.cfg, passed
+# with --appendconfig, because retroarch rewrites its own config on exit and
+# would otherwise clobber them.
+#
+# The real binary is named in full: an old PATH shim at /usr/local/bin/retroarch
+# (from the media-center days) may still be on the box.
+exec /usr/local/bin/gabetv-run /usr/bin/retroarch --appendconfig /etc/gabetv/retroarch-override.cfg "$@"

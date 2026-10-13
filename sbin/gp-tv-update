@@ -1,0 +1,23 @@
+#!/bin/bash
+# gp-tv-update: bring /opt/gp-tv up to origin/main and reinstall when it moved.
+#
+# Run by gp-tv-update.timer every 5 minutes (gabetv-gamemode pauses the timer
+# while a game runs). The checkout is a deployment, not a workspace: anything
+# edited inside it on the Pi is overwritten. Settings live in /etc/gp-tv/tv.env,
+# outside the repo.
+#
+# install.sh records the commit it last finished in /var/lib/gp-tv/installed, so
+# an install that failed halfway is retried on the next run instead of skipped.
+set -eu
+REPO=/opt/gp-tv
+STAMP=/var/lib/gp-tv/installed
+
+cd "$REPO"
+git fetch -q origin main 2>/dev/null || { echo "no route to the repo, trying again next time"; exit 0; }
+if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
+  git reset -q --hard origin/main
+fi
+head=$(git rev-parse HEAD)
+[ "$(cat "$STAMP" 2>/dev/null)" = "$head" ] && exit 0
+echo "installing $head"
+exec "$REPO/install.sh"

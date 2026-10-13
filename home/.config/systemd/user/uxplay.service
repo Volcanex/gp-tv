@@ -1,0 +1,12 @@
+[Unit]
+Description=UxPlay AirPlay mirroring receiver (HDMI)
+After=pipewire.service network-online.target avahi-daemon.service
+
+[Service]
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+ExecStart=/usr/bin/uxplay -n "GabeTV" -vs kmssink -nh -s 1280x720 -al 0.25 -reset 30 -fps 30 -FPSdata
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

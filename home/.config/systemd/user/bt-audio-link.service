@@ -1,0 +1,12 @@
+[Unit]
+Description=Link Bluetooth audio to the speaker output
+After=pipewire.service wireplumber.service
+Requires=pipewire.service
+
+[Service]
+ExecStart=%h/bt-audio-link.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

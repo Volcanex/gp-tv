@@ -1,0 +1,64 @@
+#!/bin/bash
+# gabetv-run: run a game on the TV with the stage cleared. Usage: gabetv-run CMD [ARGS...]
+#
+# The one place that prepares the box for a game and puts it back afterwards.
+# gabetv-emu (retroarch) is a thin wrapper around this; native games from the
+# gabetv menu call it directly.
+#
+#   - uxplay holds DRM master the whole time it runs, so it is stopped and
+#     restarted after. bt-audio-link (relinks bluetooth audio every 3s) likewise.
+#   - gabetv-gamemode on/off pauses and restores non-essential services.
+#   - gabetv-gamemode rt gives the game realtime cpu priority.
+#   - native games have no common quit button, so gabetv-padquit ends them on
+#     the PS button. retroarch handles PS itself.
+# The trap restores everything even if the game crashes or this is killed.
+set -u
+
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+# SDL games draw straight to the screen (no desktop) and play through the TV.
+# retroarch ignores these: it drives KMS and ALSA itself.
+export SDL_VIDEODRIVER=kmsdrm
+export SDL_AUDIODRIVER=alsa
+export AUDIODEV=hdmi:CARD=vc4hdmi,DEV=0
+# Games using OpenAL (SuperTux) ignore the SDL vars above.
+export ALSOFT_CONF=/etc/gabetv/alsoft.conf
+
+had_uxplay=0
+had_btlink=0
+qpid=""
+restore() {
+  [ -n "$qpid" ] && kill "$qpid" 2>/dev/null
+  sudo -n /usr/local/sbin/gabetv-gamemode off
+  [ "$had_btlink" = 1 ] && systemctl --user start bt-audio-link
+  [ "$had_uxplay" = 1 ] && systemctl --user start uxplay
+}
+trap restore EXIT
+
+if systemctl --user is-active --quiet uxplay 2>/dev/null; then
+  had_uxplay=1
+  systemctl --user stop uxplay
+fi
+if systemctl --user is-active --quiet bt-audio-link 2>/dev/null; then
+  had_btlink=1
+  systemctl --user stop bt-audio-link
+fi
+sudo -n /usr/local/sbin/gabetv-gamemode on
+
+# Wait for the DRM device to actually be released, rather than guessing a sleep.
+for _ in $(seq 1 40); do
+  fuser /dev/dri/card0 >/dev/null 2>&1 || break
+  sleep 0.25
+done
+
+"$@" &
+gpid=$!
+for _ in $(seq 1 20); do
+  [ -d /proc/$gpid ] && [ "$(cat /proc/$gpid/comm 2>/dev/null)" != bash ] && break
+  sleep 0.1
+done
+sudo -n /usr/local/sbin/gabetv-gamemode rt "$gpid"
+if [ "$(basename "$1")" != retroarch ]; then
+  /usr/local/bin/gabetv-padquit "$gpid" &
+  qpid=$!
+fi
+wait "$gpid"

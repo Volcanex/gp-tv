@@ -1,0 +1,12 @@
+# systemd user unit on the Pi: ~/.config/systemd/user/padhub.service (the pi user lingers, so it
+# starts at boot without a login). See pi/README.md.
+[Unit]
+Description=padhub: the Pi's gamepads over a WebSocket for the newcastle game on the Mac
+
+[Service]
+ExecStart=/usr/bin/python3 %h/padhub/padhub.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

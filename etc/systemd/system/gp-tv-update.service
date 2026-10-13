@@ -1,0 +1,9 @@
+[Unit]
+Description=gp-tv: pull the repo and reinstall when it changed
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/gp-tv-update
+Nice=10

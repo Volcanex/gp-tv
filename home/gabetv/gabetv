@@ -1,0 +1,1100 @@
+#!/usr/bin/env python3
+"""
+GabeTV: a dashboard for the day, a menu, and the Pi's diagnostics.
+
+The home screen, shown with no keypress, is today's g-system calendar (most of
+the screen), tomorrow, the local weather, a big clock and the part of the
+daily routine we are in (routine.txt beside this file). Any button opens the
+menu: Diagnostics, the games, and the system actions. After a spell with no
+input it falls back to the home screen.
+
+Runs on tty1, the HDMI console. Pure stdlib curses, no dependencies. Reads the
+keyboard and every /dev/input/js* directly, so a PS3 pad drives it with no
+key-mapping daemon in the way.
+
+Design note. Everything expensive lives in the Sampler thread on a slow
+cadence, and draw() only ever reads the snapshot it publishes. The previous
+version shelled out about twenty times every five seconds, two of them
+full-boot journalctl scans, which is a lot of work for a board that is already
+fighting for current.
+
+Graphs are deliberately ascii. The linux console font has no unicode block
+glyphs, so the usual sparkline characters come out as blanks on a tv.
+
+AirPlay and games override this automatically by taking DRM; the console
+reappears underneath when they exit.
+
+Undo: remove the launch line from ~/.bash_profile.
+"""
+import curses, datetime, json, os, re, shlex, struct, subprocess, threading, time
+import urllib.parse
+import urllib.request
+from collections import deque
+
+HIST   = 110         # samples kept for the fast sparklines
+SHIST  = 60          # samples kept for the slow ones
+FAST   = 2           # seconds between cheap samples (pure file reads)
+SLOW   = 25          # seconds between expensive samples (subprocesses)
+RAMP   = "_.:-=+*#"  # 8 ascii levels, low to high
+
+CORE_DIR = "/usr/lib/aarch64-linux-gnu/libretro"
+ROMS     = os.path.expanduser("~/roms")
+LEASES   = "/var/lib/misc/dnsmasq.leases"
+
+# Only systems this chip can actually hold at full speed. No n64. PlayStation
+# runs on pcsx_rearmed (arm dynarec), which debian does not package, so its core
+# was dropped into CORE_DIR by hand from the libretro buildbot on 2026-09-23.
+# Debian's pcsxr would not keep up: it falls back to an interpreter.
+SYSTEMS = [
+    ("NES",              "nestopia",        (".nes", ".fds")),
+    ("SNES",             "snes9x",          (".sfc", ".smc")),
+    ("Mega Drive",       "genesis_plus_gx", (".md", ".gen", ".bin")),
+    ("Master System",    "genesis_plus_gx", (".sms", ".gg")),
+    ("Game Boy",         "gambatte",        (".gb", ".gbc")),
+    ("Game Boy Advance", "mgba",            (".gba",)),
+    ("Virtual Boy",      "mednafen_vb",     (".vb",)),
+    ("WonderSwan",       "mednafen_wswan",  (".ws", ".wsc")),
+    ("PlayStation",      "pcsx_rearmed",    (".cue", ".chd", ".pbp")),
+]
+
+BACK = object()          # sentinel: a menu entry that pops back up a level
+DIAG = object()          # sentinel: the menu entry that opens diagnostics
+
+# Set while a command launched from the menu (a game, mostly) is running. The
+# Sampler sleeps instead of sampling: its vcgencmd calls go through the same
+# firmware as the headphone audio and were measured stalling retroarch.
+PAUSED = threading.Event()
+
+
+def sh(cmd, default="?", timeout=6):
+    try:
+        out = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                             timeout=timeout).stdout.strip()
+        return out or default
+    except Exception:
+        return default
+
+
+def read(path, default=""):
+    try:
+        with open(path) as fh:
+            return fh.read()
+    except OSError:
+        return default
+
+
+# ---------------------------------------------------------------- sampler ---
+class Sampler(threading.Thread):
+    """Collects everything the board shows, so drawing costs nothing."""
+    daemon = True
+
+    def __init__(self):
+        super().__init__()
+        self.lock = threading.Lock()
+        self.cpu  = deque(maxlen=HIST)
+        self.temp = deque(maxlen=HIST)
+        self.net  = deque(maxlen=HIST)
+        self.uv   = deque(maxlen=SHIST)    # undervolted at this sample, 0 or 1
+        self.mem  = deque(maxlen=HIST)     # percent of ram in use
+        self.wan  = deque(maxlen=SHIST)    # internet round trip, ms
+        self.events = []
+        self.slow = {}
+        self._cpu_prev = None
+        self._net_prev = None
+        self._t_prev = None
+        self.ready = False
+
+    # ---- cheap tier: file reads only, no processes ----
+    def _cpu_pct(self):
+        parts = read("/proc/stat").split("\n")[0].split()[1:]
+        if not parts:
+            return 0.0
+        vals = [int(x) for x in parts]
+        idle, total = vals[3] + vals[4], sum(vals)
+        if self._cpu_prev is None:
+            self._cpu_prev = (idle, total)
+            return 0.0
+        di = idle - self._cpu_prev[0]
+        dt = total - self._cpu_prev[1]
+        self._cpu_prev = (idle, total)
+        return max(0.0, min(100.0, 100.0 * (1 - di / dt))) if dt > 0 else 0.0
+
+    def _net_bps(self):
+        rx = tx = 0
+        for line in read("/proc/net/dev").split("\n")[2:]:
+            if ":" not in line:
+                continue
+            name, rest = line.split(":", 1)
+            if name.strip() != "wlan0":
+                continue
+            f = rest.split()
+            rx, tx = int(f[0]), int(f[8])
+        now = time.time()
+        if self._net_prev is None:
+            self._net_prev, self._t_prev = (rx, tx), now
+            return 0.0
+        dt = max(0.001, now - self._t_prev)
+        bps = ((rx - self._net_prev[0]) + (tx - self._net_prev[1])) / dt
+        self._net_prev, self._t_prev = (rx, tx), now
+        return max(0.0, bps)
+
+    def _mem_pct(self):
+        info = {}
+        for line in read("/proc/meminfo").split("\n"):
+            k, _, v = line.partition(":")
+            if v:
+                info[k] = float(v.split()[0])
+        total = info.get("MemTotal", 1)
+        avail = info.get("MemAvailable", total)
+        return max(0.0, min(100.0, 100.0 * (total - avail) / total))
+
+    def fast(self):
+        c = self._cpu_pct()
+        t = int(read("/sys/class/thermal/thermal_zone0/temp", "0") or 0) / 1000.0
+        n = self._net_bps()
+        m = self._mem_pct()
+        with self.lock:
+            self.cpu.append(c)
+            self.temp.append(t)
+            self.net.append(n)
+            self.mem.append(m)
+
+    # ---- expensive tier ----
+    def stations(self):
+        """Live GabeFi clients, with the numbers the driver will give us.
+
+        This radio does not report per station signal in AP mode, so rate and
+        idle time are what we have. Names come from the dhcp leases, keyed by
+        mac, because the station dump only knows hardware addresses."""
+        names, ips = {}, {}
+        for line in read(LEASES).split("\n"):
+            p = line.split()
+            if len(p) > 3:
+                names[p[1].lower()] = p[3]
+                ips[p[1].lower()] = p[2]
+
+        dump = sh("/usr/sbin/iw dev wlan0 station dump 2>/dev/null", "", timeout=8)
+        out, cur = [], None
+        for line in dump.split("\n"):
+            line = line.strip()
+            m = re.match(r"^Station ([0-9a-f:]{17})", line, re.I)
+            if m:
+                mac = m.group(1).lower()
+                cur = {"mac": mac, "name": names.get(mac, mac[-8:]),
+                       "ip": ips.get(mac, "?"), "tx": "?", "rx": "?",
+                       "idle": "?", "ping": "-"}
+                out.append(cur)
+            elif cur is not None and ":" in line:
+                k, _, v = line.partition(":")
+                k, v = k.strip(), v.strip()
+                if k == "tx bitrate":   cur["tx"] = v.split()[0].split(".")[0]
+                elif k == "rx bitrate": cur["rx"] = v.split()[0].split(".")[0]
+                elif k == "inactive time":
+                    try: cur["idle"] = "%ds" % (int(v.split()[0]) // 1000)
+                    except ValueError: pass
+
+        return out
+
+    def pads(self):
+        out = []
+        base = "/sys/class/power_supply"
+        try:
+            found = sorted(d for d in os.listdir(base) if d.startswith("sony_controller"))
+        except OSError:
+            found = []
+        for i, d in enumerate(found):
+            out.append({"name": "PS3 pad %d" % (i + 1),
+                        "pct": read(os.path.join(base, d, "capacity"), "?").strip(),
+                        "status": read(os.path.join(base, d, "status"), "?").strip()})
+        return out
+
+    def kernel_events(self):
+        """One journal scan, not three. The old code ran a full boot scan twice
+        every refresh just to get a count and a timestamp, which is real work on
+        a board that is short of current."""
+        raw = sh("journalctl -k -b --no-pager -o short 2>/dev/null | "
+                 "grep -iE 'Undervoltage detected|now disconnected|Link is Down|"
+                 "link becomes ready|hdmi|oom|segfault'", "", timeout=20)
+        lines = [l for l in raw.split("\n") if l.strip()]
+        uv = [l for l in lines if "ndervoltage" in l]
+        last = " ".join(uv[-1].split()[:3]) if uv else ""
+        pretty = []
+        for l in lines[-7:]:
+            p = l.split()
+            when = " ".join(p[:3]) if len(p) > 3 else ""
+            what = l.split(": ", 1)[-1] if ": " in l else l
+            pretty.append((when, what[:74]))
+        return len(uv), last, pretty
+
+    def slow_refresh(self):
+        uv_count, uv_last, events = self.kernel_events()
+        t = sh("vcgencmd get_throttled | cut -d= -f2", "0x0")
+        try: tv = int(t, 16)
+        except ValueError: tv = 0
+
+        up = sh("ip route show default | head -1 | awk '{for(i=1;i<=NF;i++) if($i==\"dev\") print $(i+1)}'", "none")
+        d = {
+            "throttled_raw": t,
+            "uv_now":  tv & 1,
+            "thr_now": (tv >> 2) & 1,
+            "uv_ever": (tv >> 16) & 1,
+            "uv_count": str(uv_count),
+            "uv_last":  uv_last,
+            "uplink": {"eth1": "iPhone over USB", "wlan1": "iPhone hotspot",
+                       "eth0": "Ethernet"}.get(up, up),
+            "fallback": "Armed" if sh("ip route show default | grep -c wlan1", "0") != "0" else "Asleep",
+            "wan_ms": sh("ping -c1 -W2 1.1.1.1 2>/dev/null | tail -1 | cut -d/ -f5 | cut -d. -f1", "?"),
+            "airplay": "Streaming" if sh("ss -tnp 2>/dev/null | grep -c uxplay", "0") != "0" else "Idle, ready",
+            "chan": sh("/usr/sbin/iw dev wlan0 info 2>/dev/null | awk '/channel/{print $2}'", "?"),
+            "width": sh("/usr/sbin/iw dev wlan0 info 2>/dev/null | grep -o 'width: [0-9]* MHz' | cut -d' ' -f2-", "?"),
+            "arm": sh("vcgencmd measure_clock arm | cut -d= -f2 | awk '{printf \"%d\", $1/1000000}'", "?"),
+            "core": sh("vcgencmd measure_clock core | cut -d= -f2 | awk '{printf \"%d\", $1/1000000}'", "?"),
+            "mem": sh("free -m | awk '/^Mem:/{printf \"%d of %d MB\", $3, $2}'", "?"),
+            "disk": sh("df -h / | awk 'NR==2{printf \"%s of %s\", $3, $2}'", "?"),
+            "load": sh("cut -d' ' -f1-3 /proc/loadavg", "?"),
+            "uptime": sh("uptime -p | sed 's/^up //'", "?"),
+            "stations": self.stations(),
+            "pads": self.pads(),
+        }
+        try:
+            self.wan.append(float(d["wan_ms"]))
+        except (TypeError, ValueError):
+            pass
+        with self.lock:
+            self.uv.append(1 if d["uv_now"] else 0)
+            self.events = events
+            self.slow = d
+            self.ready = True
+
+    def snapshot(self):
+        with self.lock:
+            return {"slow": dict(self.slow), "cpu": list(self.cpu),
+                    "temp": list(self.temp), "net": list(self.net),
+                    "uv": list(self.uv), "mem": list(self.mem),
+                    "wan": list(self.wan), "events": list(self.events)}
+
+    def run(self):
+        self.slow_refresh()
+        last_slow = time.time()
+        while True:
+            if PAUSED.is_set():
+                time.sleep(FAST)
+                continue
+            try:
+                self.fast()
+                if time.time() - last_slow > SLOW:
+                    self.slow_refresh()
+                    last_slow = time.time()
+            except Exception:
+                pass                     # a stats board must never take the tv down
+            time.sleep(FAST)
+
+
+# ------------------------------------------------------------------ graphs ---
+def spark(series, lo=None, hi=None, width=HIST):
+    if not series:
+        return ""
+    s = list(series)[-width:]
+    lo = min(s) if lo is None else lo
+    hi = max(s) if hi is None else hi
+    if hi - lo < 1e-9:
+        hi = lo + 1
+    return "".join(RAMP[min(len(RAMP) - 1,
+                    max(0, int((v - lo) / (hi - lo) * (len(RAMP) - 1))))] for v in s)
+
+
+def bar(pct, width=22):
+    pct = max(0.0, min(100.0, pct))
+    fill = int(round(pct / 100.0 * width))
+    return "[" + "#" * fill + "." * (width - fill) + "]"
+
+
+def human_bps(b):
+    for unit, div in (("MB/s", 1e6), ("kB/s", 1e3)):
+        if b >= div:
+            return "%.1f %s" % (b / div, unit)
+    return "%d B/s" % b
+
+
+# -------------------------------------------------------------------- menu ---
+def roms_for(exts, so):
+    """Every rom under ~/roms with one of these extensions, newest name order.
+    Drop a file in and it appears on the next rebuild. Nothing to register."""
+    out = []
+    for root, _dirs, files in os.walk(ROMS):
+        if os.path.basename(root) == "saves":
+            continue
+        # A .bin sitting next to a .cue is a disc track, not a Mega Drive rom.
+        has_cue = any(x.lower().endswith(".cue") for x in files)
+        for f in sorted(files):
+            ext = os.path.splitext(f)[1].lower()
+            if ext not in exts:
+                continue
+            if ext == ".bin" and has_cue:
+                continue
+            out.append((os.path.splitext(f)[0],
+                        "/usr/local/bin/gabetv-emu -L %s %s"
+                        % (shlex.quote(so), shlex.quote(os.path.join(root, f)))))
+    return out
+
+
+def games():
+    """One entry per system, each opening a list of its roms.
+
+    A flat list of every game does not survive a real collection, and the
+    system is the thing you pick first anyway."""
+    out = []
+    for label, core, exts in SYSTEMS:
+        so = os.path.join(CORE_DIR, core + "_libretro.so")
+        if not os.path.exists(so):
+            continue
+        found = roms_for(exts, so)
+        if not found:
+            continue
+        sub = [("Play " + name, cmd) for name, cmd in found]
+        sub.append(("Back", BACK))
+        out.append(("%s roms  (%d)" % (label, len(found)), sub))
+    return out
+
+
+DISCONNECT_PADS = (
+    "for m in $(bluetoothctl devices 2>/dev/null | grep -i playstation "
+    "| awk '{print $2}'); do bluetoothctl disconnect $m >/dev/null 2>&1; done; "
+    "echo 'controllers disconnected'"
+)
+
+STATIC_MENU = [
+    ("Refresh status",        None),
+    ("Sleep controllers",     DISCONNECT_PADS),
+    ("Restart airplay",       "systemctl --user restart uxplay"),
+    ("Reboot",                "sudo reboot"),
+]
+
+
+# Native games: real programs for this chip, no emulation. Each entry shows
+# only when its program, any data file it names, and its 'needs' path exist. Launched
+# through gabetv-run, which clears the stage and quits on the PS button.
+RA = ["--appendconfig", "/etc/gabetv/retroarch-override.cfg", "-L"]
+LIBRETRO = "/usr/lib/aarch64-linux-gnu/libretro/"
+PORTS = [
+    # label                program                      args                                  shown only if this exists
+    ("Cave Story",         "/usr/bin/retroarch",        RA + [LIBRETRO + "nxengine_libretro.so",
+                                                              os.path.expanduser("~/roms/ports/CaveStory/Doukutsu.exe")], None),
+    ("Tyrian 2000",        "/usr/games/opentyrian",     [],                                   "/usr/share/games/tyrian"),
+    ("Doom (shareware)",   "/usr/games/chocolate-doom", ["-iwad", "/usr/share/games/doom/doom1.wad"], None),
+    ("Freedoom: Phase 1",  "/usr/games/chocolate-doom", ["-iwad", "/usr/share/games/doom/freedoom1.wad"], None),
+    ("Freedoom: Phase 2",  "/usr/games/chocolate-doom", ["-iwad", "/usr/share/games/doom/freedoom2.wad"], None),
+    ("SuperTux",           "/usr/games/supertux2",      [],                                   None),
+    ("C-Dogs",             "/usr/games/cdogs-sdl",      [],                                   None),
+]
+
+
+def ports():
+    sub = []
+    for label, prog, args, needs in PORTS:
+        if not os.path.exists(prog) or (needs and not os.path.exists(needs)):
+            continue
+        if any(a.startswith("/") and not os.path.exists(a) for a in args):
+            continue
+        sub.append(("Play " + label, "/usr/local/bin/gabetv-run "
+                    + " ".join(shlex.quote(x) for x in [prog] + args)))
+    if not sub:
+        return []
+    sub.append(("Back", BACK))
+    return [("PC games  (%d)" % (len(sub) - 1), sub)]
+
+
+def build_menu():
+    return [("Diagnostics", DIAG)] + games() + ports() + STATIC_MENU
+
+
+# --------------------------------------------------------------------- pad ---
+class PadHub(threading.Thread):
+    """Reads every /dev/input/js*, so either controller drives the menu."""
+    daemon = True
+
+    def __init__(self):
+        super().__init__()
+        self.q = []
+        self.seen = {}
+
+    def _reader(self, path):
+        try:
+            with open(path, "rb") as f:
+                while True:
+                    ev = f.read(8)
+                    if len(ev) < 8:
+                        break
+                    _, val, typ, num = struct.unpack("IhBB", ev)
+                    if typ & 0x80:
+                        continue
+                    if typ & 0x02:
+                        if num in (1, 5, 7):
+                            if val < -16000: self.q.append("up")
+                            elif val > 16000: self.q.append("down")
+                    elif typ & 0x01 and val == 1:
+                        if num in (4, 13):   self.q.append("up")
+                        elif num in (6, 14): self.q.append("down")
+                        else:                self.q.append("select")
+        except Exception:
+            pass
+        finally:
+            self.seen.pop(path, None)
+
+    def run(self):
+        while True:
+            try:
+                for n in sorted(os.listdir("/dev/input")):
+                    if not n.startswith("js"):
+                        continue
+                    p = "/dev/input/" + n
+                    if p not in self.seen:
+                        th = threading.Thread(target=self._reader, args=(p,), daemon=True)
+                        self.seen[p] = th
+                        th.start()
+            except Exception:
+                pass
+            time.sleep(3)
+
+    @property
+    def count(self):
+        return len(self.seen)
+
+    def get(self):
+        return self.q.pop(0) if self.q else None
+
+    def drain(self):
+        """Throw away anything queued while we were not looking.
+
+        The readers keep consuming js* for the whole time a game is on screen,
+        so the PS press that quits retroarch also lands here as a select.
+        Without this it is acted on the instant the menu redraws, and the game
+        you just quit launches straight back up."""
+        self.q.clear()
+
+
+# --------------------------------------------------------------------- day ---
+# The home screen is a dashboard for the day: today's g-system calendar (the
+# brain's dated todos, the same feed gcommand /calendar renders, recurrence
+# already expanded by the brain), tomorrow, the local weather, a big clock
+# and where the routine is up to. It shows with no keypress.
+
+# Where the calendar comes from and where the weather is for live in
+# /etc/gp-tv/gabetv.env, which install.sh writes from tv.env and .bash_profile
+# exports. Unset, the panel says so instead of fetching.
+CAL_URL = os.environ.get("GABETV_CAL_URL", "")
+LAT, LON = os.environ.get("GABETV_LAT", ""), os.environ.get("GABETV_LON", "")
+TZ      = os.environ.get("GABETV_TZ", "Europe/London")
+WX_URL  = ("https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s"
+           "&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m"
+           "&daily=weather_code,temperature_2m_max,temperature_2m_min,"
+           "precipitation_probability_max,sunrise,sunset"
+           "&forecast_days=2&timezone=%s&wind_speed_unit=mph"
+           % (LAT, LON, urllib.parse.quote(TZ, safe="")))
+ROUTINE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "routine.txt")
+CAL_EVERY, WX_EVERY, RETRY = 120, 900, 60     # seconds
+
+WMO = {0: "Clear", 1: "Mostly clear", 2: "Partly cloudy", 3: "Overcast",
+       45: "Fog", 48: "Freezing fog", 51: "Light drizzle", 53: "Drizzle",
+       55: "Heavy drizzle", 56: "Freezing drizzle", 57: "Freezing drizzle",
+       61: "Light rain", 63: "Rain", 65: "Heavy rain", 66: "Freezing rain",
+       67: "Freezing rain", 71: "Light snow", 73: "Snow", 75: "Heavy snow",
+       77: "Snow grains", 80: "Showers", 81: "Showers", 82: "Heavy showers",
+       85: "Snow showers", 86: "Snow showers", 95: "Thunderstorm",
+       96: "Thunder and hail", 99: "Thunder and hail"}
+
+
+def fetch_json(url, timeout=10):
+    req = urllib.request.Request(url, headers={"User-Agent": "gabetv"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)
+
+
+class Day(threading.Thread):
+    """Fetches the calendar and the weather off the draw loop, like Sampler.
+
+    A failed fetch keeps the last good copy and notes the error, so the screen
+    says it is out of date instead of going blank. Sleeps while a game runs."""
+    daemon = True
+
+    def __init__(self):
+        super().__init__()
+        self.lock = threading.Lock()
+        self.cal, self.cal_at, self.cal_err = None, 0.0, ""
+        self.wx, self.wx_at, self.wx_err = None, 0.0, ""
+        self.kick = threading.Event()
+
+    def refresh_cal(self):
+        if not CAL_URL:
+            with self.lock:
+                self.cal_err = "GABETV_CAL_URL not set"
+            return
+        today = datetime.date.today()
+        try:
+            items = fetch_json("%s?date_from=%s&date_to=%s"
+                               % (CAL_URL, today, today + datetime.timedelta(days=1)))
+            with self.lock:
+                self.cal, self.cal_at, self.cal_err = items, time.time(), ""
+        except Exception as e:
+            with self.lock:
+                self.cal_err = str(e)[:50] or "no answer"
+
+    def refresh_wx(self):
+        if not (LAT and LON):
+            with self.lock:
+                self.wx_err = "GABETV_LAT and GABETV_LON not set"
+            return
+        try:
+            wx = fetch_json(WX_URL)
+            with self.lock:
+                self.wx, self.wx_at, self.wx_err = wx, time.time(), ""
+        except Exception as e:
+            with self.lock:
+                self.wx_err = str(e)[:50] or "no answer"
+
+    def snapshot(self):
+        with self.lock:
+            return {"cal": self.cal, "cal_at": self.cal_at, "cal_err": self.cal_err,
+                    "wx": self.wx, "wx_at": self.wx_at, "wx_err": self.wx_err}
+
+    def run(self):
+        next_cal = next_wx = 0.0
+        date = datetime.date.today()
+        while True:
+            if not PAUSED.is_set():
+                now = time.time()
+                if datetime.date.today() != date:       # midnight: today moved on
+                    date = datetime.date.today()
+                    self.kick.set()
+                force = self.kick.is_set()
+                self.kick.clear()
+                if force or now >= next_cal:
+                    self.refresh_cal()
+                    next_cal = now + (RETRY if self.cal_err else CAL_EVERY)
+                if force or now >= next_wx:
+                    self.refresh_wx()
+                    next_wx = now + (RETRY if self.wx_err else WX_EVERY)
+            self.kick.wait(5)
+
+
+def load_routine():
+    """{'weekday': [(start, end, name, note)], 'weekend': [...]}, minutes past midnight."""
+    out, part = {"weekday": [], "weekend": []}, None
+    for line in read(ROUTINE).split("\n"):
+        line = line.split("#", 1)[0].strip()
+        if line in ("[weekday]", "[weekend]"):
+            part = line[1:-1]
+            continue
+        m = re.match(r"(\d{1,2}):(\d\d)\s+(\d{1,2}):(\d\d)\s+(.+)$", line)
+        if not m or part is None:
+            continue
+        name, _, note = m.group(5).partition("/")
+        out[part].append((int(m.group(1)) * 60 + int(m.group(2)),
+                          int(m.group(3)) * 60 + int(m.group(4)),
+                          name.strip(), note.strip()))
+    for blocks in out.values():
+        blocks.sort()
+    return out
+
+
+def routine_now(routine, now):
+    """The block we are in (or None, between blocks) and the one after it."""
+    blocks = routine["weekend" if now.weekday() >= 5 else "weekday"]
+    m = now.hour * 60 + now.minute
+    cur = next((b for b in blocks if b[0] <= m < b[1]), None)
+    nxt = next((b for b in blocks if b[0] > m), blocks[0] if blocks else None)
+    return cur, nxt
+
+
+def hm(mins):
+    """Minutes past midnight as Gabriel writes times: 9am, 10:30am, 12am."""
+    h, m = divmod(int(mins) % 1440, 60)
+    return "%d%s%s" % (h % 12 or 12, ":%02d" % m if m else "", "am" if h < 12 else "pm")
+
+
+def hm_str(s):
+    """'13:00' -> '1pm'."""
+    try:
+        h, m = s.split(":")[:2]
+        return hm(int(h) * 60 + int(m))
+    except (AttributeError, ValueError):
+        return ""
+
+
+# Big clock digits, 3 by 5 cells; each "#" is drawn as a solid block of
+# reverse-video spaces, which the console font can show (it has no unicode
+# block glyphs).
+BIG = {
+    "0": ["###", "# #", "# #", "# #", "###"], "1": [" # ", "## ", " # ", " # ", "###"],
+    "2": ["###", "  #", "###", "#  ", "###"], "3": ["###", "  #", "###", "  #", "###"],
+    "4": ["# #", "# #", "###", "  #", "  #"], "5": ["###", "#  ", "###", "  #", "###"],
+    "6": ["###", "#  ", "###", "# #", "###"], "7": ["###", "  #", "  #", "  #", "  #"],
+    "8": ["###", "# #", "###", "# #", "###"], "9": ["###", "# #", "###", "  #", "###"],
+    ":": [" ", "#", " ", "#", " "],
+}
+
+
+def big_width(text, sx):
+    return sum(len(BIG[c][0]) * sx for c in text) + sx * (len(text) - 1)
+
+
+def put_big(put, y, x, text, sx, sy, attr):
+    for c in text:
+        glyph = BIG[c]
+        for r, row in enumerate(glyph):
+            for col, px in enumerate(row):
+                if px == "#":
+                    for dy in range(sy):
+                        put(y + r * sy + dy, x + col * sx, " " * sx, attr)
+        x += len(glyph[0]) * sx + sx
+
+
+# ------------------------------------------------------------------- draw ---
+class Screen:
+    """The drawing helpers every screen shares; never lets a long string or a
+    small screen kill the board."""
+
+    def __init__(self, scr):
+        self.scr = scr
+        self.h, self.w = scr.getmaxyx()
+        self.HEAD = curses.color_pair(1) | curses.A_BOLD
+        self.LBL  = curses.color_pair(5) | curses.A_BOLD
+        self.DIM  = curses.color_pair(5)
+        self.OK   = curses.color_pair(2) | curses.A_BOLD
+        self.WARN = curses.color_pair(3) | curses.A_BOLD
+        self.BAD  = curses.color_pair(4) | curses.A_BOLD
+        self.SEL  = curses.color_pair(6) | curses.A_BOLD
+
+    def put(self, y, x, s, attr=0):
+        if y < 0 or y >= self.h or x < 0 or x >= self.w:
+            return
+        try:
+            self.scr.addnstr(y, x, str(s), max(0, self.w - x - 1), attr)
+        except curses.error:
+            pass
+
+    def rule(self, y):
+        self.put(y, 3, "-" * max(0, self.w - 6), self.DIM)
+
+    def header(self, title):
+        self.put(1, 3, "GabeTV", self.HEAD)
+        self.put(1, 13, title, self.LBL)
+
+    def status(self, y, slow, day=None):
+        """One line of the diagnostics that matter day to day."""
+        if not slow:
+            self.put(y, 3, "Collecting...", self.DIM)
+            return
+        x = 3
+        def seg(text, attr):
+            nonlocal x
+            self.put(y, x, text, attr)
+            x += len(text) + 3
+        uvc = slow.get("uv_count", "?")
+        if slow.get("uv_now"):
+            seg("Power browning out", self.BAD)
+        else:
+            seg("Power healthy" + ("" if uvc in ("0", "?") else ", %s brownouts" % uvc),
+                self.OK if uvc in ("0", "?") else self.WARN)
+        up = slow.get("uplink", "none")
+        seg("Internet %s %s ms" % (up, slow.get("wan_ms", "?")) if up != "none" else "Internet down",
+            self.DIM if up != "none" else self.BAD)
+        pads = slow.get("pads", [])
+        seg("Pads " + (", ".join("%s%%" % p["pct"] for p in pads) if pads else "asleep"), self.DIM)
+        if day and (day["cal_err"] or day["wx_err"]):
+            seg("Offline: " + " and ".join(n for n, e in (("calendar", day["cal_err"]),
+                                                            ("weather", day["wx_err"])) if e), self.WARN)
+
+
+def cal_lines(items, today, now_min, width):
+    """A day's todos as (text, attr-name) rows: timed ones in time order, then
+    the ones with no time. Settled ones (done, missed) sink to the end of each."""
+    timed = sorted((i for i in items if i.get("time")),
+                   key=lambda i: (i["time"], not i.get("vital")))
+    loose = sorted((i for i in items if not i.get("time")),
+                   key=lambda i: (bool(i.get("done") or i.get("failed")),
+                                  not i.get("vital"), not i.get("urgent"), i.get("title", "")))
+    rows = []
+
+    def row(i, when):
+        mark = "!" if i.get("vital") else "*" if i.get("urgent") else " "
+        title = i.get("title") or i.get("summary") or "?"
+        tail, style = "", "ok"
+        if i.get("done"):
+            tail, style = "  done", "done"
+        elif i.get("dropped"):
+            tail, style = "  dropped", "bad"
+        elif i.get("failed"):
+            tail, style = "  missed", "bad"
+        elif i.get("late_days"):
+            d = i["late_days"]
+            tail, style = "  %d day%s late" % (d, "" if d == 1 else "s"), "late"
+        elif today and i.get("time") and hm_mins(i["time"]) < now_min:
+            style = "past"
+        elif i.get("vital"):
+            style = "vital"
+        text = "%7s %s %s" % (when, mark, title)
+        if len(text) + len(tail) > width:
+            text = text[:max(10, width - len(tail) - 3)] + "..."
+        rows.append((text + tail, style))
+
+    for i in timed:
+        row(i, hm_str(i["time"]))
+    if timed and loose:
+        rows.append(("", "gap"))
+    for i in loose:
+        row(i, "")
+    return rows
+
+
+def hm_mins(s):
+    try:
+        h, m = s.split(":")[:2]
+        return int(h) * 60 + int(m)
+    except (AttributeError, ValueError):
+        return 0
+
+
+def draw_home(scr, sam, day, routine):
+    """The dashboard for the day. Calendar on the left taking most of the
+    screen, weather top right, the routine and a big clock bottom right."""
+    S = Screen(scr)
+    scr.erase()
+    h, w = S.h, S.w
+    now = datetime.datetime.now()
+    d = day.snapshot()
+    S.header(now.strftime("%A %d %B").replace(" 0", " "))
+    S.put(1, max(40, w - 20), "Any button: menu", S.DIM)
+    S.rule(2)
+
+    right_w = 54 if w >= 150 else 42 if w >= 110 else 0     # the weather/clock column
+    cx, cw = 3, (w - 6 - right_w - 4) if right_w else w - 6
+    rx = w - 3 - right_w
+    bottom = h - 3                              # status line sits on h - 2
+
+    # ---- calendar ----
+    style = {"ok": S.OK, "done": curses.color_pair(2), "bad": S.BAD, "late": S.WARN,
+             "past": S.DIM, "vital": S.WARN, "gap": 0}
+    items = d["cal"] or []
+    today, tomorrow = now.date().isoformat(), (now.date() + datetime.timedelta(days=1)).isoformat()
+    now_min = now.hour * 60 + now.minute
+    t_rows = cal_lines([i for i in items if i.get("date") == today], True, now_min, cw)
+    m_rows = cal_lines([i for i in items if i.get("date") == tomorrow], False, now_min, cw)
+
+    y = 4
+    open_n = sum(1 for i in items if i.get("date") == today and not i.get("done") and not i.get("failed"))
+    S.put(y, cx, "TODAY", S.HEAD)
+    S.put(y, cx + 7, "%d open" % open_n if d["cal"] is not None else "", S.DIM)
+    if d["cal_err"] and d["cal"] is not None:
+        S.put(y, cx + 20, "calendar unreachable, showing %s" % time.strftime("%H:%M", time.localtime(d["cal_at"])), S.WARN)
+    y += 2
+    avail = bottom - y
+    want_tomorrow = min(len(m_rows), 8) + 3 if m_rows else 3
+    today_room = max(3, avail - want_tomorrow)
+    if d["cal"] is None:
+        S.put(y, cx + 2, "Reaching the brain..." if not d["cal_err"] else
+              "Calendar unreachable (%s)" % d["cal_err"], S.DIM if not d["cal_err"] else S.WARN)
+        y += 1
+    elif not t_rows:
+        S.put(y, cx + 2, "Nothing on today.", S.DIM)
+        y += 1
+    else:
+        shown = t_rows if len(t_rows) <= today_room else t_rows[:today_room - 1]
+        for text, st in shown:
+            S.put(y, cx, text, style[st])
+            y += 1
+        if len(shown) < len(t_rows):
+            S.put(y, cx + 10, "+ %d more" % (len(t_rows) - len(shown)), S.DIM)
+            y += 1
+
+    y += 1
+    if y < bottom - 1 and d["cal"] is not None:
+        S.put(y, cx, "TOMORROW", S.HEAD)
+        S.put(y, cx + 10, (now + datetime.timedelta(days=1)).strftime("%A"), S.DIM)
+        y += 2
+        room = bottom - y
+        if not m_rows:
+            S.put(y, cx + 2, "Nothing on yet.", S.DIM)
+        else:
+            shown = m_rows if len(m_rows) <= room else m_rows[:max(0, room - 1)]
+            for text, st in shown:
+                S.put(y, cx, text, S.DIM if st in ("ok", "past") else style[st])
+                y += 1
+            if len(shown) < len(m_rows) and room > 0:
+                S.put(y, cx + 10, "+ %d more" % (len(m_rows) - len(shown)), S.DIM)
+
+    if right_w:
+        # ---- weather ----
+        y = 4
+        S.put(y, rx, "NEWCASTLE", S.HEAD)
+        wx = d["wx"]
+        if wx:
+            S.put(y, rx + 11, "outside, %s" % time.strftime("%H:%M", time.localtime(d["wx_at"])), S.DIM)
+            y += 2
+            c, dy = wx.get("current", {}), wx.get("daily", {})
+            S.put(y, rx, "%.0fC" % c.get("temperature_2m", 0), S.OK)
+            S.put(y, rx + 6, WMO.get(c.get("weather_code"), "?"), S.OK)
+            y += 1
+            S.put(y, rx, "Feels %.0fC, wind %.0f mph" % (c.get("apparent_temperature", 0),
+                                                        c.get("wind_speed_10m", 0)), S.LBL)
+            y += 2
+            for k, label in ((0, "Today"), (1, "Tomorrow")):
+                try:
+                    S.put(y, rx, "%-9s" % label, S.LBL)
+                    S.put(y, rx + 10, "%s, %.0f/%.0fC, rain %s%%" % (
+                        WMO.get(dy["weather_code"][k], "?"), dy["temperature_2m_max"][k],
+                        dy["temperature_2m_min"][k], dy["precipitation_probability_max"][k]), S.OK)
+                except (KeyError, IndexError, TypeError):
+                    pass
+                y += 1
+            try:
+                S.put(y, rx, "%-9s" % "Daylight", S.LBL)
+                S.put(y, rx + 10, "%s to %s" % (hm_str(dy["sunrise"][0].split("T")[1]),
+                                               hm_str(dy["sunset"][0].split("T")[1])), S.OK)
+            except (KeyError, IndexError, AttributeError):
+                pass
+        else:
+            y += 2
+            S.put(y, rx, "Weather unreachable" if d["wx_err"] else "Fetching the weather...", S.DIM)
+        weather_end = y + 2
+
+        # ---- clock and routine, bottom right ----
+        cur, nxt = routine_now(routine, now)
+        clock = now.strftime("%H:%M")
+        rows_below = 5
+        for sx, sy in ((3, 2), (2, 2), (2, 1)):     # the biggest clock that fits
+            if big_width(clock, sx) <= right_w and bottom - rows_below - 5 * sy >= weather_end:
+                break
+        cy = bottom - rows_below - 5 * sy
+        put_big(S.put, cy, rx + (right_w - big_width(clock, sx)) // 2, clock, sx, sy, S.SEL)
+        y = cy + 5 * sy + 1
+        if cur:
+            S.put(y, rx, "NOW", S.LBL)
+            S.put(y, rx + 5, cur[2].upper(), S.HEAD)
+            S.put(y, rx + 6 + len(cur[2]), "%s to %s" % (hm(cur[0]), hm(cur[1])), S.LBL)
+            y += 1
+            if cur[3]:
+                S.put(y, rx + 5, cur[3], S.OK)
+            y += 1
+            left = cur[1] - (now.hour * 60 + now.minute)
+            S.put(y, rx + 5, "%s left" % ("%dh %02dm" % divmod(left, 60) if left >= 60 else "%d min" % left), S.DIM)
+            y += 1
+        else:
+            S.put(y, rx, "NOW", S.LBL)
+            S.put(y, rx + 5, "Between blocks", S.OK)
+            y += 3
+        if nxt:
+            S.put(y, rx, "NEXT", S.LBL)
+            S.put(y, rx + 5, "%s at %s" % (nxt[2], hm(nxt[0])), S.DIM)
+
+    S.status(h - 2, sam.snapshot()["slow"], d)
+    scr.refresh()
+
+
+def draw_menu(scr, sel, sam, menu, msg, day):
+    """The menu on its own screen: Diagnostics, the games, the system actions."""
+    S = Screen(scr)
+    scr.erase()
+    S.header(time.strftime("%a %d %b  %H:%M"))
+    S.rule(2)
+    S.put(4, 3, "MENU", S.HEAD)
+    row, top = 6, 0
+    room = S.h - 10
+    if sel >= room:
+        top = sel - room + 1
+    for i, (label, _) in enumerate(menu[top:top + room], start=top):
+        if i == sel:
+            S.put(row, 3, " > %-40s" % label, S.SEL)
+        else:
+            S.put(row, 3, "   " + label, curses.color_pair(2))
+        row += 1
+    S.rule(S.h - 4)
+    hint = "Pad: d-pad to move, any button to select.   Keys: arrows, enter, q to quit"
+    if not sam.slow.get("pads"):
+        hint = "No controller connected.   Keys: arrows, enter, q to quit"
+    S.put(S.h - 3, 3, msg or hint, S.LBL)
+    S.status(S.h - 2, sam.snapshot()["slow"], day.snapshot())
+    scr.refresh()
+
+
+def draw_diag(scr, sam):
+    """Diagnostics: the core health numbers and their recent history."""
+    S = Screen(scr)
+    scr.erase()
+    snap = sam.snapshot()
+    slow, cpu, temp = snap["slow"], snap["cpu"], snap["temp"]
+    mem, uv, wan = snap["mem"], snap["uv"], snap["wan"]
+    S.header("Diagnostics   " + time.strftime("%H:%M:%S"))
+    S.rule(2)
+    if not slow:
+        S.put(4, 3, "Collecting...", S.LBL)
+        scr.refresh()
+        return
+
+    def field(y, x, label, value, attr=S.OK):
+        S.put(y, x, "%-14s" % label, S.LBL)
+        S.put(y, x + 15, value, attr)
+
+    c1, c2 = 3, 60 if S.w >= 110 else 3
+    y = 4
+    S.put(y, c1, "POWER AND SYSTEM", S.HEAD); y += 2
+    uv_now = slow["uv_now"]
+    field(y, c1, "Power now", "Browning out" if uv_now else "Healthy", S.BAD if uv_now else S.OK); y += 1
+    field(y, c1, "Throttled", "Yes" if slow["thr_now"] else "No", S.WARN if slow["thr_now"] else S.OK); y += 1
+    field(y, c1, "Brownouts", "%s since boot%s" % (slow["uv_count"], ", last " + slow["uv_last"] if slow["uv_last"] else ""),
+          S.WARN if slow["uv_count"] not in ("0", "?") else S.OK); y += 1
+    field(y, c1, "Memory", slow["mem"]); y += 1
+    field(y, c1, "Disk", slow["disk"]); y += 1
+    field(y, c1, "Uptime", slow["uptime"]); y += 1
+    left_end = y
+
+    y = 4 if c2 != c1 else left_end + 1
+    S.put(y, c2, "NETWORK AND PADS", S.HEAD); y += 2
+    field(y, c2, "Internet", slow["uplink"], S.OK if slow["uplink"] != "none" else S.BAD); y += 1
+    field(y, c2, "Wan latency", "%s ms" % slow["wan_ms"]); y += 1
+    field(y, c2, "Airplay", slow["airplay"]); y += 1
+    field(y, c2, "GabeFi", "%d connected" % len(slow["stations"])); y += 1
+    for p in slow["pads"]:
+        field(y, c2, p["name"], "%s%%  %s" % (p["pct"], p["status"]),
+              S.WARN if p["pct"].isdigit() and int(p["pct"]) < 20 else S.OK); y += 1
+    if not slow["pads"]:
+        field(y, c2, "Pads", "None awake", S.LBL); y += 1
+
+    gy = max(left_end, y) + 1
+
+    def graph(row, label, series, lo, hi, cur, attr=S.OK, width=HIST):
+        if row >= S.h - 3:
+            return row
+        width = min(width, S.w - 30)
+        S.put(row, c1, "%-11s" % label, S.LBL)
+        S.put(row, c1 + 12, "%-*s" % (width, spark(series, lo, hi, width)), attr)
+        S.put(row, c1 + 13 + width, "%9s" % cur, attr)
+        return row + 1
+
+    span = HIST * FAST
+    S.put(gy, c1, "LAST %s" % ("%d SECONDS" % span if span < 120 else "%d MINUTES" % (span // 60)), S.HEAD)
+    gy += 2
+    gy = graph(gy, "Cpu", cpu, 0, 100, "%.1f%%" % (cpu[-1] if cpu else 0))
+    gy = graph(gy, "Temp", temp, 30, 85, "%.1fC" % (temp[-1] if temp else 0),
+               S.WARN if temp and temp[-1] > 70 else S.OK)
+    gy = graph(gy, "Memory", mem, 0, 100, "%.0f%%" % (mem[-1] if mem else 0))
+    if wan:
+        gy = graph(gy, "Wan ping", wan, 0, max(200.0, max(wan)), "%.0f ms" % wan[-1], width=SHIST)
+    if uv:
+        gy = graph(gy, "Brownouts", uv, 0, 1, "%d of %d" % (sum(uv), len(uv)),
+                   S.BAD if any(uv) else S.OK, width=SHIST)
+    S.put(S.h - 2, 3, "Any button: back to the menu", S.LBL)
+    scr.refresh()
+
+
+IDLE_AFTER = 30          # seconds without input before the menu returns home
+DIAG_IDLE  = 300         # diagnostics is for reading, so it stays up longer
+
+
+def main(scr):
+    curses.curs_set(0); scr.nodelay(True); scr.keypad(True)
+    curses.start_color(); curses.use_default_colors()
+    for i, c in enumerate([curses.COLOR_CYAN, curses.COLOR_WHITE, curses.COLOR_YELLOW,
+                           curses.COLOR_RED, curses.COLOR_CYAN], start=1):
+        curses.init_pair(i, c, -1)
+    curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_CYAN)
+
+    sam = Sampler(); sam.start()
+    day = Day(); day.start()
+    pad = PadHub(); pad.start()
+    menu = build_menu()
+    routine, routine_at = load_routine(), time.time()
+    stack = []
+    screen = "home"                         # home | menu | diag
+    sel, msg, msg_t, last_menu = 0, "", 0, time.time()
+    last_input = time.time()
+
+    while True:
+        # Only rebuild at the root, or opening a rom list would be snatched away
+        # mid browse every ten seconds.
+        if not stack and time.time() - last_menu > 10:
+            menu = build_menu()
+            sel = min(sel, len(menu) - 1)
+            last_menu = time.time()
+        if time.time() - routine_at > 60:
+            routine, routine_at = load_routine(), time.time()
+        if msg and time.time() - msg_t > 4:
+            msg = ""
+        idle = time.time() - last_input
+        if screen != "home" and idle > (DIAG_IDLE if screen == "diag" else IDLE_AFTER):
+            screen, stack, sel = "home", [], 0
+            menu = build_menu()
+
+        if screen == "home":
+            draw_home(scr, sam, day, routine)
+        elif screen == "diag":
+            draw_diag(scr, sam)
+        else:
+            draw_menu(scr, sel, sam, menu, msg, day)
+
+        act = None
+        k = scr.getch()
+        if k in (curses.KEY_UP, ord("k")): act = "up"
+        elif k in (curses.KEY_DOWN, ord("j")): act = "down"
+        elif k in (curses.KEY_ENTER, 10, 13, ord(" ")): act = "select"
+        elif k in (ord("q"), 27): return
+        if act is None:
+            act = pad.get()
+        if act is None and k == -1:
+            time.sleep(0.12)
+            continue
+        last_input = time.time()
+        if screen == "home":            # the press that wakes the menu does nothing else
+            screen = "menu"
+            continue
+        if screen == "diag":
+            screen = "menu"
+            continue
+
+        if act == "up":
+            sel = (sel - 1) % len(menu)
+        elif act == "down":
+            sel = (sel + 1) % len(menu)
+        elif act == "select":
+            label, cmd = menu[sel]
+            if cmd is BACK:
+                menu = stack.pop() if stack else menu
+                sel = 0
+                continue
+            if cmd is DIAG:
+                screen = "diag"
+                continue
+            if isinstance(cmd, list):
+                stack.append(menu)
+                menu = cmd
+                sel = 0
+                continue
+            if label == "Refresh status":
+                threading.Thread(target=sam.slow_refresh, daemon=True).start()
+                day.kick.set()
+                msg, msg_t = "Refreshing...", time.time()
+            elif cmd:
+                curses.endwin()
+                print("\n  running: %s\n" % label)
+                PAUSED.set()
+                try:
+                    subprocess.run(cmd, shell=True)
+                finally:
+                    PAUSED.clear()
+                time.sleep(2)
+                pad.drain()
+                curses.flushinp()
+                scr.clear(); curses.doupdate()
+                threading.Thread(target=sam.slow_refresh, daemon=True).start()
+                if stack:
+                    menu, stack, sel = stack[0], [], 0
+                msg, msg_t = "%s done" % label, time.time()
+                last_input = time.time()
+        time.sleep(0.12)
+
+
+if __name__ == "__main__":
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass

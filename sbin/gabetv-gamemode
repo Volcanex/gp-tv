@@ -1,0 +1,69 @@
+#!/bin/bash
+# gabetv-gamemode on|off|rt PID
+#
+# While a game runs, pause everything the game does not need, then put back
+# exactly what was running. Added 2026-09-23 after measuring that background
+# samplers (the old health page, vcgencmd polls) stalled retroarch's audio.
+#
+# Called by gabetv-emu through a narrow sudoers rule
+# (/etc/sudoers.d/gabetv-gamemode, installed by gp-tv). Kept OUT of this list on purpose:
+# bluetooth (the pads), hostapd + dnsmasq (GabeFi), NetworkManager and
+# wpa_supplicant (wifi), ssh.
+#
+# State: /run/gabetv-gamemode.stopped lists what "on" stopped. It lives on
+# tmpfs, so a reboot clears it and every enabled service starts as normal.
+# See what is paused right now: cat /run/gabetv-gamemode.stopped
+set -u
+STATE=/run/gabetv-gamemode.stopped
+
+# Stop order. Restart runs in reverse, so avahi is back before shairport.
+UNITS=(
+  shairport-sync.service          # airplay audio
+  avahi-daemon.socket             # mdns, only airplay discovery needs it
+  avahi-daemon.service
+  cron.service
+  gabepi-uplink-watch.service     # re-dials the uplink every 15s; wifi stays up
+  usbmuxd.service                 # iphone usb tether helper
+  gp-tv-update.timer              # git fetch every 5 minutes
+  apt-daily.timer
+  apt-daily-upgrade.timer
+  man-db.timer
+  rpi-zram-writeback.timer
+  e2scrub_all.timer
+  fstrim.timer
+  dpkg-db-backup.timer
+  logrotate.timer
+  systemd-tmpfiles-clean.timer
+)
+
+case "${1:-}" in
+  on)
+    [ -e "$STATE" ] && exit 0            # already in game mode
+    : > "$STATE"
+    for u in "${UNITS[@]}"; do
+      if systemctl is-active --quiet "$u"; then
+        systemctl stop "$u" && echo "$u" >> "$STATE"
+      fi
+    done
+    ;;
+  off)
+    [ -e "$STATE" ] || exit 0
+    tac "$STATE" | while read -r u; do systemctl start "$u"; done
+    rm -f "$STATE"
+    ;;
+  rt)
+    # Realtime priority for the game, so nothing on the box can preempt a
+    # frame. Only ever applied to a known game binary owned by pi, so this sudo rule
+    # cannot be used to boost anything else. SCHED_FIFO 10: above normal
+    # tasks, below the kernel's own threaded irqs (50).
+    pid="${2:-}"
+    [[ "$pid" =~ ^[0-9]+$ ]] || exit 2
+    case "$(cat /proc/$pid/comm 2>/dev/null)" in
+      retroarch|chocolate-doom|opentyrian|supertux2|cdogs-sdl|quakespasm) ;;
+      *) exit 3 ;;
+    esac
+    [ "$(stat -c %U /proc/$pid)" = pi ] || exit 3
+    chrt -f -p 10 "$pid"
+    ;;
+  *) echo "usage: $0 on|off|rt PID" >&2; exit 2 ;;
+esac

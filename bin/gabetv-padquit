@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+"""gabetv-padquit PID: end a native game when the PS button is pressed.
+
+Native games each have their own quit menu, most of them keyboard-first. This
+gives every game launched from gabetv the same exit retroarch has: the PS
+button. Reads every /dev/input/js* directly (same approach as gabetv), sends
+SIGTERM, then SIGKILL if the game has not gone after 3s. Started and stopped
+by gabetv-run.
+"""
+import glob, os, select, signal, struct, sys, time
+
+PS_BUTTON = 10          # hid-sony numbering, same as input_exit_emulator_btn
+EVENT = struct.Struct("IhBB")   # time, value, type, number
+JS_BUTTON = 0x01
+
+pid = int(sys.argv[1])
+fds = []
+for path in glob.glob("/dev/input/js*"):
+    try:
+        fds.append(os.open(path, os.O_RDONLY | os.O_NONBLOCK))
+    except OSError:
+        pass
+
+def alive():
+    return os.path.exists("/proc/%d" % pid)
+
+while alive():
+    ready, _, _ = select.select(fds, [], [], 1.0) if fds else ([], [], time.sleep(1))
+    for fd in ready:
+        try:
+            data = os.read(fd, EVENT.size * 16)
+        except OSError:
+            continue
+        for i in range(0, len(data) - EVENT.size + 1, EVENT.size):
+            _t, value, etype, number = EVENT.unpack_from(data, i)
+            if etype & JS_BUTTON and not etype & 0x80 and number == PS_BUTTON and value == 1:
+                os.kill(pid, signal.SIGTERM)
+                for _ in range(30):
+                    if not alive():
+                        sys.exit(0)
+                    time.sleep(0.1)
+                os.kill(pid, signal.SIGKILL)
+                sys.exit(0)

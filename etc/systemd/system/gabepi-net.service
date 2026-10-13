@@ -1,0 +1,17 @@
+[Unit]
+Description=GabePi AP address and NAT
+After=network.target
+Before=hostapd.service dnsmasq.service
+Wants=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=-/usr/sbin/rfkill unblock wifi
+ExecStart=-/usr/sbin/ip link set wlan0 up
+ExecStart=-/usr/sbin/ip addr add 10.42.0.1/24 dev wlan0
+ExecStart=-/usr/sbin/sysctl -w net.ipv4.ip_forward=1
+ExecStart=/bin/bash /usr/local/sbin/gabepi-nat.sh
+
+[Install]
+WantedBy=multi-user.target

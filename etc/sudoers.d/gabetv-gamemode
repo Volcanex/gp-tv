@@ -1,0 +1,4 @@
+# gabetv-run pauses background services around a game through gabetv-gamemode,
+# with sudo -n, so it must not ask for a password. The dashboard menu's Reboot
+# entry runs sudo reboot. Installed by gp-tv after a visudo check.
+pi ALL=(root) NOPASSWD: /usr/local/sbin/gabetv-gamemode, /usr/sbin/reboot

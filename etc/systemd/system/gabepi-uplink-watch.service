@@ -1,0 +1,13 @@
+[Unit]
+Description=GabePi uplink watchdog (keeps the wlan1 standby ready)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash /usr/local/sbin/gabepi-uplink-watch.sh
+Restart=always
+RestartSec=15
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

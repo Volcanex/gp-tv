@@ -1,0 +1,26 @@
+interface=wlan0
+driver=nl80211
+ssid=${GABEFI_SSID}
+country_code=${WIFI_COUNTRY}
+hw_mode=a
+channel=36
+ieee80211d=1
+ieee80211n=1
+ieee80211ac=1
+ht_capab=[HT40+][SHORT-GI-20][SHORT-GI-40]
+vht_capab=[SHORT-GI-80]
+vht_oper_chwidth=0
+vht_oper_centr_freq_seg0_idx=38
+wmm_enabled=1
+macaddr_acl=0
+auth_algs=1
+ignore_broadcast_ssid=0
+wpa=2
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+wpa_passphrase=${GABEFI_PSK}
+ctrl_interface=/var/run/hostapd
+ctrl_interface_group=0
+
+# see gabefi-deny.txt for why the iPhone is denied
+deny_mac_file=/etc/hostapd/gabefi-deny.txt
