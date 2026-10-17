@@ -1,3 +1,8 @@
 tv.env
 __pycache__/
 *.bak*
+
+# Secrets stay local: an .env never goes to a public repo.
+.env
+.env.*
+!.env.example
